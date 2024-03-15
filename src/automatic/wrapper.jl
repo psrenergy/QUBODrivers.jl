@@ -19,8 +19,8 @@ function QUBOTools.metadata(sampler::AutomaticSampler)
     return QUBOTools.metadata(sampler.model)
 end
 
-function QUBOTools.warm_start(sampler::AutomaticSampler)
-    return QUBOTools.warm_start(sampler.model)
+function QUBOTools.start(sampler::AutomaticSampler)
+    return QUBOTools.start(sampler.model)
 end
 
 # ~*~ :: MathOptInterface :: ~*~ #

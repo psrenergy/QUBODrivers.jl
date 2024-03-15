@@ -1,8 +1,31 @@
+module QUBOTools.MOIWrapper
+
+import QUBOTools
+
+function QUBOTools.varlt(x::VI, y::VI)
+    return isless(x.value, y.value)
+end
+
+function QUBOTools.sense(sense::MOI.OptimizationSense)
+    if sense === MOI.MIN_SENSE
+        return QUBOTools.sense(:min)
+    elseif sense === MOI.MAX_SENSE
+        return QUBOTools.sense(:max)
+    else
+        error("Invalid sense for QUBO: '$sense'")
+
+        return nothing
+    end
+end
+
+end
+
 @doc raw"""
     Spin()
 
 The set ``\left\lbrace{}{-1, 1}\right\rbrace{}``.
-""" struct Spin <: MOI.AbstractScalarSet end
+"""
+struct Spin <: MOI.AbstractScalarSet end
 
 function MOIU._to_string(options::MOIU._PrintOptions, ::Spin)
     return string(MOIU._to_string(options, ∈), " {-1, 1}")
@@ -26,21 +49,15 @@ MOI.supports_constraint(
     ::Type{<:MOI.ZeroOne},
 ) = true
 
-MOI.supports_constraint(
-    ::AbstractSampler,
-    ::Type{<:MOI.VariableIndex},
-    ::Type{<:Spin},
-) = true
+MOI.supports_constraint(::AbstractSampler, ::Type{<:MOI.VariableIndex}, ::Type{<:Spin}) =
+    true
 
 # ~ Objective Function Support
-MOI.supports(
-    ::AbstractSampler,
-    ::MOI.ObjectiveFunction{<:Any}
-) = false
+MOI.supports(::AbstractSampler, ::MOI.ObjectiveFunction{<:Any}) = false
 
 MOI.supports(
     ::AbstractSampler{T},
-    ::MOI.ObjectiveFunction{<:Union{SQF{T}, SAF{T}, VI}}
+    ::MOI.ObjectiveFunction{<:Union{SQF{T},SAF{T},VI}},
 ) where {T} = true
 
 # By default, all samplers are their own raw solvers.
@@ -64,14 +81,19 @@ function reads(model; result::Integer = 1)
     return QUBOTools.reads(model, result)
 end
 
-function QUBOTools.Sense(sense::MOI.OptimizationSense)
-    if sense === MOI.MIN_SENSE
-        return QUBOTools.Sense(:min)
-    elseif sense === MOI.MAX_SENSE
-        return QUBOTools.Sense(:max)
-    else
-        error("Invalid sense for QUBO: '$sense'")
-    end
+function qubo_parse_error(msg::AbstractString)
+    # Throw ToQUBO.jl advertisement on parsing error:
+    error(
+        """
+        The current model could not be converted to QUBO in a straightforward fashion:
+        - $msg
+
+        Consider using the ToQUBO.jl package, a sophisticated reformulation framework.
+            pkg> add ToQUBO # 😎
+        """,
+    )
+
+    return nothing
 end
 
 @doc raw"""
@@ -85,17 +107,18 @@ A few conditions must be met:
     2. No other constraints are allowed
     3. The objective function must be of type `MOI.ScalarQuadraticFunction`, `MOI.ScalarAffineFunction` or `MOI.VariableIndex`
     4. The objective sense must be either `MOI.MIN_SENSE` or `MOI.MAX_SENSE`
-""" function parse_model end
+"""
+function parse_model end
 
 function parse_model(model::MOI.ModelLike)
     return parse_model(Float64, model)
 end
 
-function __is_quadratic(model::MOI.ModelLike)
+function _is_quadratic(model::MOI.ModelLike)
     return MOI.get(model, MOI.ObjectiveFunctionType()) <: Union{SQF,SAF,VI}
 end
 
-function __is_unconstrained(model::MOI.ModelLike)
+function _is_unconstrained(model::MOI.ModelLike)
     for (F, S) in MOI.get(model, MOI.ListOfConstraintTypesPresent())
         if !(F === VI && (S === MOI.ZeroOne || S === Spin))
             return false
@@ -105,18 +128,61 @@ function __is_unconstrained(model::MOI.ModelLike)
     return true
 end
 
-function __is_optimization(model::MOI.ModelLike)
+function _is_optimization(model::MOI.ModelLike)
     S = MOI.get(model, MOI.ObjectiveSense())
 
     return (S === MOI.MAX_SENSE || S === MOI.MIN_SENSE)
 end
 
-function __extract_model(
-    ::Type{T},
-    Ω::Set{VI},
-    model::MOI.ModelLike,
-    ::QUBOTools.BoolDomain,
-) where {T}
+function _extract_model(::Type{T}, Ω::Set{VI}, model::MOI.ModelLike, domain::QUBOTools.Domain) where {T}
+    if domain === QUBOTools.BoolDomain
+        return _extract_bool_model(T, Ω, model)
+    elseif domain === QUBOTools.SpinDomain
+        return _extract_spin_model(T, Ω, model)
+    else
+        error("Invalid domain '$domain'")
+
+        return nothing
+    end
+end
+
+function _extract_variable_info(model::MOI.ModelLike)
+    Ω = Set{VI}(MOI.get(model, MOI.ListOfVariableIndices()))
+    𝔹 = Set{VI}(
+        MOI.get(model, MOI.ConstraintFunction(), ci) for
+        ci in MOI.get(model, MOI.ListOfConstraintIndices{VI,MOI.ZeroOne}())
+    )
+    𝕊 = if MOI.supports_constraint(model, VI, Spin)
+        Set{VI}(
+            MOI.get(model, MOI.ConstraintFunction(), ci) for
+            ci in MOI.get(model, MOI.ListOfConstraintIndices{VI,Spin}())
+        )
+    else # Models aren't obligated to support `Spin`!
+        Set{VI}() # empty set
+    end
+
+    # Retrieve Variable Domain
+    # Assuming 𝕊, 𝔹 ⊆ Ω
+    if !isempty(𝕊) && !isempty(𝔹)
+        qubo_parse_error("The given model contains both boolean and spin variables")
+    elseif isempty(𝕊) # QUBO model?
+        if 𝔹 != Ω
+            qubo_parse_error("Not all variables in the given model are boolean")
+        else
+            return (Ω, QUBOTools.domain(:bool))
+        end
+    elseif isempty(𝔹) # Ising model?
+        if 𝕊 != Ω
+            qubo_parse_error("Not all variables in the given model are spin")
+        else
+            return (Ω, QUBOTools.domain(:spin))
+        end
+    end
+    
+    return nothing
+end
+
+function _extract_bool_model(::Type{T}, Ω::Set{VI}, model::MOI.ModelLike) where {T}
     L = Dict{VI,T}(xi => zero(T) for xi ∈ Ω)
     Q = Dict{Tuple{VI,VI},T}()
 
@@ -166,12 +232,7 @@ function __extract_model(
     return (L, Q, offset)
 end
 
-function __extract_model(
-    ::Type{T},
-    Ω::Set{VI},
-    model::MOI.ModelLike,
-    ::QUBOTools.SpinDomain,
-) where {T}
+function _extract_spin_model(::Type{T}, Ω::Set{VI}, model::MOI.ModelLike) where {T}
     L = Dict{VI,T}(xi => zero(T) for xi ∈ Ω)
     Q = Dict{Tuple{VI,VI},T}()
 
@@ -221,7 +282,6 @@ function __extract_model(
     return (L, Q, offset)
 end
 
-
 function parse_model(T::Type, model::MOI.ModelLike)
     # ~*~ Check for emptiness ~*~ #
     if MOI.is_empty(model)
@@ -234,93 +294,33 @@ function parse_model(T::Type, model::MOI.ModelLike)
     end
 
     # ~*~ Validate Model ~*~ #
-    flag = false
-
-    if !__is_quadratic(model)
-        @error "The given model's objective function is not a quadratic or linear polynomial"
-        flag = true
+    if !_is_quadratic(model)
+        qubo_parse_error("The given model's objective function is not a quadratic or linear polynomial")
     end
 
-    if !__is_optimization(model)
-        @error "The given model lacks an optimization sense"
-        flag = true
+    if !_is_optimization(model)
+        qubo_parse_error("The given model lacks an optimization sense")
     end
 
-    if !__is_unconstrained(model)
-        @error "The given model is not unconstrained"
-        flag = true
+    if !_is_unconstrained(model)
+        qubo_parse_error("The given model is not unconstrained")
     end
 
-    Ω = Set{VI}(MOI.get(model, MOI.ListOfVariableIndices()))
-    𝔹 = Set{VI}(
-        MOI.get(model, MOI.ConstraintFunction(), ci) for
-        ci in MOI.get(model, MOI.ListOfConstraintIndices{VI,MOI.ZeroOne}())
-    )
-    𝕊 = if MOI.supports_constraint(model, VI, Spin)
-        Set{VI}(
-            MOI.get(model, MOI.ConstraintFunction(), ci) for
-            ci in MOI.get(model, MOI.ListOfConstraintIndices{VI,Spin}())
-        )
-    else # Models aren't obligated to support `Spin`!
-        Set{VI}() # empty set
-    end
-
-    # ~*~ Retrieve Variable Domain ~*~ #
-    # Assuming:
-    # - 𝕊, 𝔹 ⊆ Ω
-    domain = if !isempty(𝕊) && !isempty(𝔹)
-        @error "The given model contains both boolean and spin variables"
-        flag = true
-
-        nothing
-    elseif isempty(𝕊) # QUBO model?
-        if 𝔹 != Ω
-            @error "Not all variables in the given model are boolean"
-            flag = true
-
-            nothing
-        else
-            QUBOTools.BoolDomain()
-        end
-    elseif isempty(𝔹) # Ising model?
-        if 𝕊 != Ω
-            @error "Not all variables in the given model are spin"
-            flag = true
-
-            nothing
-        else
-            QUBOTools.SpinDomain()
-        end
-    end
-
-    if flag
-        # Throw ToQUBO.jl advertisement on parsing error:
-        error(
-            """
-            The current model could not be converted to QUBO in a straightforward fashion.
-            Consider using the ToQUBO.jl package, a sophisticated reformulation framework.
-                pkg> add ToQUBO # 😎
-            """
-        )
-    end
+    Ω, domain = _extract_variable_info(model)
 
     # ~*~ Retrieve Model ~*~ #
-    L, Q, offset = __extract_model(T, Ω, model, domain)
+    L, Q, offset = _extract_model(T, Ω, model, domain)
     scale        = one(T)
 
     # ~*~ Objective Sense ~*~ #
-    sense = QUBOTools.Sense(MOI.get(model, MOI.ObjectiveSense()))
+    sense = QUBOTools.sense(MOI.get(model, MOI.ObjectiveSense()))
 
     # ~*~ Return Model ~*~ #
     return QUBOTools.Model{VI,T,Int}(
-        L, Q;
+        Ω, L, Q;
         scale  = scale,
         offset = offset,
         sense  = sense,
         domain = domain,
     )
-end
-
-function QUBOTools.varlt(x::VI, y::VI)
-    return isless(x.value, y.value)
 end

@@ -179,8 +179,8 @@ function __setup_parse_params(block::Expr)
     end
 
     # Post-processing
-    params[:sense]      = QUBOTools.Sense(params[:sense])
-    params[:domain]     = QUBOTools.Domain(params[:domain])
+    params[:sense]      = QUBOTools.sense(params[:sense])
+    params[:domain]     = QUBOTools.domain(params[:domain])
     params[:attributes] = __setup_attr.(params[:attributes])
 
     return params
